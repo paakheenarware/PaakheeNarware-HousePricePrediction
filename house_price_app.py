@@ -1,0 +1,634 @@
+"""
+===============================================================================
+ HOUSE PRICE PREDICTION SYSTEM  -  single-file full-stack project
+===============================================================================
+ Backend  : pandas / NumPy / scikit-learn  (data cleaning, feature engineering,
+            model training, evaluation, prediction)
+ Frontend : Streamlit + Matplotlib / Seaborn  (interactive web interface)
+
+ Run with :   streamlit run house_price_app.py
+
+ The file is organised in clearly separated sections:
+   1. CONFIGURATION
+   2. BACKEND  - data layer
+   3. BACKEND  - machine-learning layer
+   4. BACKEND  - visualisation helpers
+   5. FRONTEND - Streamlit pages
+   6. APPLICATION ENTRY POINT
+===============================================================================
+"""
+
+# ----------------------------------------------------------------------------
+# Imports
+# ----------------------------------------------------------------------------
+import io
+import os
+import warnings
+
+import joblib
+import matplotlib
+
+matplotlib.use("Agg")  # non-interactive backend, safe for web servers
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import streamlit as st
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import cross_val_score, train_test_split, KFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer, StandardScaler
+
+warnings.filterwarnings("ignore")
+
+# ============================================================================
+# 1. CONFIGURATION
+# ============================================================================
+APP_TITLE = "House Price Prediction System"
+DATA_FILE = "house_price_regression_dataset.csv"  # keep next to this script
+MODEL_FILE = "house_price_model.joblib"           # created after first training
+TARGET = "House_Price"
+BASE_FEATURES = [
+    "Square_Footage",
+    "Num_Bedrooms",
+    "Num_Bathrooms",
+    "Year_Built",
+    "Lot_Size",
+    "Garage_Size",
+    "Neighborhood_Quality",
+]
+REFERENCE_YEAR = 2024  # fixed so that "House_Age" is reproducible
+RANDOM_STATE = 42
+TEST_SIZE = 0.20
+CV_FOLDS = 5
+
+FEATURE_HELP = {
+    "Square_Footage": "Built-up area of the house in square feet",
+    "Num_Bedrooms": "Number of bedrooms",
+    "Num_Bathrooms": "Number of bathrooms",
+    "Year_Built": "Year in which the house was constructed",
+    "Lot_Size": "Size of the plot / lot (acres)",
+    "Garage_Size": "Number of cars the garage can hold",
+    "Neighborhood_Quality": "Neighbourhood rating from 1 (poor) to 10 (excellent)",
+}
+
+
+# ============================================================================
+# 2. BACKEND - DATA LAYER
+# ============================================================================
+def load_data(source) -> pd.DataFrame:
+    """Load the dataset from a file path or an uploaded file-like object."""
+    df = pd.read_csv(source)
+    missing = [c for c in BASE_FEATURES + [TARGET] if c not in df.columns]
+    if missing:
+        raise ValueError(f"Dataset is missing required column(s): {missing}")
+    return df[BASE_FEATURES + [TARGET]]
+
+
+def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove duplicates / missing values and impossible records."""
+    df = df.drop_duplicates().dropna().copy()
+    df = df[(df[TARGET] > 0) & (df["Square_Footage"] > 0)]
+    return df.reset_index(drop=True)
+
+
+def add_features(X: pd.DataFrame) -> pd.DataFrame:
+    """
+    Feature engineering (runs inside the sklearn Pipeline, so the same logic
+    is automatically applied at training time and at prediction time).
+    """
+    X = X.copy()
+    X["House_Age"] = REFERENCE_YEAR - X["Year_Built"]
+    X["Total_Rooms"] = X["Num_Bedrooms"] + X["Num_Bathrooms"]
+    X["Sqft_per_Bedroom"] = X["Square_Footage"] / X["Num_Bedrooms"].clip(lower=1)
+    return X
+
+
+def dataset_summary(df: pd.DataFrame) -> dict:
+    """Small dictionary of headline statistics for the dashboard."""
+    return {
+        "rows": len(df),
+        "features": len(BASE_FEATURES),
+        "avg_price": df[TARGET].mean(),
+        "median_price": df[TARGET].median(),
+        "min_price": df[TARGET].min(),
+        "max_price": df[TARGET].max(),
+    }
+
+
+# ============================================================================
+# 3. BACKEND - MACHINE-LEARNING LAYER
+# ============================================================================
+def build_pipeline(estimator) -> Pipeline:
+    """feature engineering -> scaling -> regressor."""
+    return Pipeline(
+        steps=[
+            ("features", FunctionTransformer(add_features, validate=False)),
+            ("scale", StandardScaler()),
+            ("model", estimator),
+        ]
+    )
+
+
+def candidate_models() -> dict:
+    """Regression algorithms that are compared against each other."""
+    return {
+        "Linear Regression": LinearRegression(),
+        "Ridge Regression": Ridge(alpha=1.0),
+        "Random Forest": RandomForestRegressor(
+            n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1
+        ),
+        "Gradient Boosting": GradientBoostingRegressor(
+            n_estimators=200, learning_rate=0.05, max_depth=3, random_state=RANDOM_STATE
+        ),
+    }
+
+
+def rmse(y_true, y_pred) -> float:
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+def train_and_evaluate(df: pd.DataFrame) -> dict:
+    """
+    Train every candidate model, evaluate on a hold-out test set plus k-fold
+    cross-validation, and select the best model (lowest cross-validated RMSE).
+
+    Returns a dictionary ("bundle") holding everything the frontend needs.
+    """
+    X = df[BASE_FEATURES]
+    y = df[TARGET]
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
+    )
+    cv = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+
+    rows, fitted, predictions = [], {}, {}
+    for name, estimator in candidate_models().items():
+        pipe = build_pipeline(estimator)
+        cv_rmse = -cross_val_score(
+            pipe, X_train, y_train, cv=cv, scoring="neg_root_mean_squared_error"
+        ).mean()
+        pipe.fit(X_train, y_train)
+        pred = pipe.predict(X_test)
+        rows.append(
+            {
+                "Model": name,
+                "R2 (test)": r2_score(y_test, pred),
+                "MAE (test)": mean_absolute_error(y_test, pred),
+                "RMSE (test)": rmse(y_test, pred),
+                f"RMSE ({CV_FOLDS}-fold CV)": cv_rmse,
+            }
+        )
+        fitted[name] = pipe
+        predictions[name] = pred
+
+    results = pd.DataFrame(rows).set_index("Model")
+    best_name = results[f"RMSE ({CV_FOLDS}-fold CV)"].idxmin()
+    best_model = fitted[best_name]
+
+    # Permutation importance on the raw input columns (works for any model)
+    perm = permutation_importance(
+        best_model, X_test, y_test, n_repeats=10, random_state=RANDOM_STATE
+    )
+    importance = (
+        pd.Series(perm.importances_mean, index=BASE_FEATURES)
+        .sort_values(ascending=False)
+        .rename("Importance")
+    )
+
+    bundle = {
+        "results": results,
+        "models": fitted,
+        "predictions": predictions,
+        "best_name": best_name,
+        "best_model": best_model,
+        "y_test": y_test.reset_index(drop=True),
+        "X_test": X_test.reset_index(drop=True),
+        "residual_std": float(np.std(y_test.values - predictions[best_name])),
+        "importance": importance,
+    }
+
+    # Persist the best model so it can be re-used outside the app
+    try:
+        joblib.dump(best_model, MODEL_FILE)
+    except Exception:
+        pass
+    return bundle
+
+
+def predict_price(model: Pipeline, inputs: dict) -> float:
+    """Predict the price for ONE house described by a dictionary."""
+    frame = pd.DataFrame([inputs], columns=BASE_FEATURES)
+    return float(model.predict(frame)[0])
+
+
+def predict_batch(model: Pipeline, frame: pd.DataFrame) -> pd.DataFrame:
+    """Predict prices for many houses at once (CSV upload)."""
+    missing = [c for c in BASE_FEATURES if c not in frame.columns]
+    if missing:
+        raise ValueError(f"Uploaded file is missing column(s): {missing}")
+    out = frame.copy()
+    out["Predicted_Price"] = model.predict(frame[BASE_FEATURES]).round(2)
+    return out
+
+
+def format_money(value: float, currency: str, inr_rate: float) -> str:
+    """Format a price in USD or in INR (lakh / crore notation)."""
+    if currency == "USD ($)":
+        return f"${value:,.0f}"
+    inr = value * inr_rate
+    if inr >= 1e7:
+        return f"₹{inr / 1e7:,.2f} Cr"
+    if inr >= 1e5:
+        return f"₹{inr / 1e5:,.2f} Lakh"
+    return f"₹{inr:,.0f}"
+
+
+# ============================================================================
+# 4. BACKEND - VISUALISATION HELPERS (return Matplotlib figures)
+# ============================================================================
+sns.set_theme(style="whitegrid", palette="deep")
+
+
+def fig_price_distribution(df):
+    fig, ax = plt.subplots(figsize=(6, 3.6))
+    sns.histplot(df[TARGET], bins=30, kde=True, ax=ax, color="#2E6FBA")
+    ax.set_xlabel("House price")
+    ax.set_title("Distribution of house prices")
+    fig.tight_layout()
+    return fig
+
+
+def fig_feature_histogram(df, column):
+    fig, ax = plt.subplots(figsize=(6, 3.6))
+    sns.histplot(df[column], bins=25, ax=ax, color="#3C9D78")
+    ax.set_title(f"Distribution of {column}")
+    fig.tight_layout()
+    return fig
+
+
+def fig_correlation(df):
+    fig, ax = plt.subplots(figsize=(7, 5.2))
+    sns.heatmap(df.corr(), annot=True, fmt=".2f", cmap="coolwarm", center=0,
+                linewidths=0.5, ax=ax, cbar_kws={"shrink": 0.8})
+    ax.set_title("Correlation matrix")
+    fig.tight_layout()
+    return fig
+
+
+def fig_scatter(df, column):
+    fig, ax = plt.subplots(figsize=(6, 3.8))
+    sns.scatterplot(data=df, x=column, y=TARGET, alpha=0.5, ax=ax, color="#C0504D")
+    sns.regplot(data=df, x=column, y=TARGET, scatter=False, ax=ax, color="black",
+                line_kws={"linewidth": 1.5})
+    ax.set_title(f"{column} vs {TARGET}")
+    fig.tight_layout()
+    return fig
+
+
+def fig_boxplot(df, column):
+    fig, ax = plt.subplots(figsize=(6, 3.8))
+    sns.boxplot(data=df, x=column, y=TARGET, ax=ax, color="#8EB4E3")
+    ax.set_title(f"Price by {column}")
+    fig.tight_layout()
+    return fig
+
+
+def fig_model_comparison(results):
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.6))
+    results["R2 (test)"].plot.bar(ax=axes[0], color="#3C9D78", rot=20)
+    axes[0].set_title("R² score (higher is better)")
+    axes[0].set_ylim(min(0.9, results["R2 (test)"].min() - 0.01), 1.0)
+    results["RMSE (test)"].plot.bar(ax=axes[1], color="#C0504D", rot=20)
+    axes[1].set_title("RMSE (lower is better)")
+    for ax in axes:
+        ax.set_xlabel("")
+    fig.tight_layout()
+    return fig
+
+
+def fig_actual_vs_pred(y_true, y_pred, name):
+    fig, ax = plt.subplots(figsize=(5.2, 4.4))
+    ax.scatter(y_true, y_pred, alpha=0.5, color="#2E6FBA")
+    lims = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
+    ax.plot(lims, lims, "r--", label="Perfect prediction")
+    ax.set_xlabel("Actual price")
+    ax.set_ylabel("Predicted price")
+    ax.set_title(f"Actual vs predicted - {name}")
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def fig_residuals(y_true, y_pred):
+    fig, ax = plt.subplots(figsize=(5.2, 4.4))
+    sns.histplot(y_true - y_pred, bins=30, kde=True, ax=ax, color="#8064A2")
+    ax.axvline(0, color="black", linestyle="--")
+    ax.set_xlabel("Residual (actual - predicted)")
+    ax.set_title("Residual distribution")
+    fig.tight_layout()
+    return fig
+
+
+def fig_importance(importance):
+    fig, ax = plt.subplots(figsize=(6, 3.8))
+    importance.sort_values().plot.barh(ax=ax, color="#E8A33D")
+    ax.set_xlabel("Drop in R² when feature is shuffled")
+    ax.set_title("Permutation feature importance")
+    fig.tight_layout()
+    return fig
+
+
+def fig_prediction_position(df, predicted):
+    fig, ax = plt.subplots(figsize=(6, 2.8))
+    sns.histplot(df[TARGET], bins=30, ax=ax, color="#BFD3EA")
+    ax.axvline(predicted, color="#C0504D", linewidth=2.5, label="Your house")
+    ax.axvline(df[TARGET].mean(), color="black", linestyle="--", label="Market average")
+    ax.set_xlabel("House price")
+    ax.set_title("Where your house sits in the market")
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+# ============================================================================
+# 5. FRONTEND - STREAMLIT PAGES
+# ============================================================================
+CUSTOM_CSS = """
+<style>
+.block-container {padding-top: 2rem;}
+.hero {background: linear-gradient(120deg,#1F4E8C,#2E6FBA); color: white;
+       padding: 1.6rem 1.8rem; border-radius: 14px; margin-bottom: 1.2rem;}
+.hero h1 {color: white; margin: 0 0 .3rem 0; font-size: 2rem;}
+.hero p {margin: 0; opacity: .92;}
+.price-card {background: #F1F6FC; border-left: 6px solid #2E6FBA; padding: 1.2rem 1.5rem;
+             border-radius: 10px; margin: .6rem 0 1rem 0;}
+.price-card h2 {margin: 0; color: #1F4E8C;}
+.price-card p {margin: .2rem 0 0 0; color: #444;}
+</style>
+"""
+
+
+def hero(title, subtitle):
+    st.markdown(f'<div class="hero"><h1>{title}</h1><p>{subtitle}</p></div>',
+                unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------- caching ----
+@st.cache_data(show_spinner=False)
+def cached_load(path_or_bytes, is_bytes=False):
+    source = io.BytesIO(path_or_bytes) if is_bytes else path_or_bytes
+    return clean_data(load_data(source))
+
+
+@st.cache_resource(show_spinner="Training models, please wait...")
+def cached_train(df):
+    return train_and_evaluate(df)
+
+
+# ------------------------------------------------------------- page: home ----
+def page_home(df, bundle, money):
+    hero("🏠 House Price Prediction System",
+         "Machine-learning powered estimates of residential property prices.")
+    s = dataset_summary(df)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Houses in dataset", f"{s['rows']:,}")
+    c2.metric("Input features", s["features"])
+    c3.metric("Average price", money(s["avg_price"]))
+    best = bundle["best_name"]
+    c4.metric("Best model R²", f"{bundle['results'].loc[best, 'R2 (test)']:.4f}")
+
+    st.subheader("How the project works")
+    st.markdown(
+        """
+        1. **Data** - a CSV of 1,000 houses with 7 attributes and the sale price.
+        2. **Backend** - cleaning, feature engineering, and four regression models
+           are trained and compared automatically with scikit-learn.
+        3. **Selection** - the model with the lowest cross-validated error is used
+           for predictions.
+        4. **Frontend** - this Streamlit interface lets you explore the data,
+           inspect model quality, and predict the price of any house.
+        """
+    )
+    st.info(f"Currently selected model: **{best}**.  "
+            "Use the sidebar to open *Predict Price*.")
+
+
+# ------------------------------------------------------- page: data explorer --
+def page_data(df, money):
+    hero("📊 Data Explorer", "Understand the dataset before trusting the model.")
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["Raw data", "Statistics", "Distributions", "Relationships"]
+    )
+    with tab1:
+        st.dataframe(df, height=380)
+        st.download_button("⬇️ Download cleaned dataset", df.to_csv(index=False),
+                           "cleaned_house_data.csv", "text/csv")
+    with tab2:
+        st.dataframe(df.describe().T.round(2))
+        st.caption("No missing values remain after cleaning: "
+                   f"{int(df.isna().sum().sum())} missing cells.")
+    with tab3:
+        col_a, col_b = st.columns(2)
+        col_a.pyplot(fig_price_distribution(df))
+        feature = col_b.selectbox("Feature", BASE_FEATURES, key="dist_feat")
+        col_b.pyplot(fig_feature_histogram(df, feature))
+    with tab4:
+        col_a, col_b = st.columns(2)
+        col_a.pyplot(fig_correlation(df))
+        feature = col_b.selectbox("Feature vs price", BASE_FEATURES, key="rel_feat")
+        discrete = df[feature].nunique() <= 10
+        col_b.pyplot(fig_boxplot(df, feature) if discrete else fig_scatter(df, feature))
+        corr = df.corr()[TARGET].drop(TARGET).sort_values(ascending=False)
+        st.write("**Correlation of each feature with price**")
+        st.bar_chart(corr)
+
+
+# ------------------------------------------------------ page: model quality --
+def page_model(bundle):
+    hero("🤖 Model Performance", "Four algorithms compared on unseen test data.")
+    results = bundle["results"]
+    best = bundle["best_name"]
+
+    st.subheader("Comparison table")
+    st.dataframe(
+        results.style.format("{:,.4f}", subset=["R2 (test)"]).format(
+            "{:,.0f}", subset=[c for c in results.columns if c != "R2 (test)"]
+        ).highlight_min(subset=[c for c in results.columns if "RMSE" in c or "MAE" in c],
+                        color="#CDEBD8").highlight_max(subset=["R2 (test)"], color="#CDEBD8"),
+    )
+    st.success(f"Selected model (lowest {CV_FOLDS}-fold CV RMSE): **{best}**")
+    st.pyplot(fig_model_comparison(results))
+
+    st.subheader("Inspect a model")
+    name = st.selectbox("Model", list(results.index),
+                        index=list(results.index).index(best))
+    y_test, y_pred = bundle["y_test"], bundle["predictions"][name]
+    c1, c2 = st.columns(2)
+    c1.pyplot(fig_actual_vs_pred(y_test, y_pred, name))
+    c2.pyplot(fig_residuals(y_test, y_pred))
+
+    st.subheader("What drives the price?")
+    st.pyplot(fig_importance(bundle["importance"]))
+    top = bundle["importance"].index[0]
+    st.caption(f"For the selected model, **{top}** is by far the most influential feature.")
+
+
+# --------------------------------------------------------- page: prediction --
+def page_predict(df, bundle, money):
+    hero("🔮 Predict House Price", "Describe a house and get an instant estimate.")
+    model = bundle["best_name"], bundle["best_model"]
+    tab_single, tab_batch = st.tabs(["Single house", "Batch (CSV upload)"])
+
+    with tab_single:
+        with st.form("predict_form"):
+            c1, c2, c3 = st.columns(3)
+            sqft = c1.number_input("Square footage", int(df.Square_Footage.min()),
+                                   int(df.Square_Footage.max() * 1.2), 2500, step=50,
+                                   help=FEATURE_HELP["Square_Footage"])
+            beds = c2.slider("Bedrooms", int(df.Num_Bedrooms.min()),
+                             int(df.Num_Bedrooms.max()), 3, help=FEATURE_HELP["Num_Bedrooms"])
+            baths = c3.slider("Bathrooms", int(df.Num_Bathrooms.min()),
+                              int(df.Num_Bathrooms.max()), 2, help=FEATURE_HELP["Num_Bathrooms"])
+            c4, c5, c6 = st.columns(3)
+            year = c4.number_input("Year built", int(df.Year_Built.min()),
+                                   REFERENCE_YEAR, 2000, help=FEATURE_HELP["Year_Built"])
+            lot = c5.number_input("Lot size (acres)", 0.1, float(df.Lot_Size.max() * 1.5),
+                                  2.5, step=0.1, help=FEATURE_HELP["Lot_Size"])
+            garage = c6.slider("Garage size (cars)", int(df.Garage_Size.min()),
+                               int(df.Garage_Size.max()), 1, help=FEATURE_HELP["Garage_Size"])
+            quality = st.slider("Neighbourhood quality (1-10)", 1, 10, 6,
+                                help=FEATURE_HELP["Neighborhood_Quality"])
+            submitted = st.form_submit_button("Predict price", type="primary")
+
+        if submitted:
+            inputs = {
+                "Square_Footage": sqft, "Num_Bedrooms": beds, "Num_Bathrooms": baths,
+                "Year_Built": year, "Lot_Size": lot, "Garage_Size": garage,
+                "Neighborhood_Quality": quality,
+            }
+            price = max(predict_price(model[1], inputs), 0)
+            margin = 1.96 * bundle["residual_std"]
+            low, high = max(price - margin, 0), price + margin
+            avg = df[TARGET].mean()
+            diff = (price - avg) / avg * 100
+
+            st.markdown(
+                f'<div class="price-card"><p>Estimated market value</p>'
+                f'<h2>{money(price)}</h2>'
+                f'<p>95% range: {money(low)} - {money(high)} &nbsp;|&nbsp; '
+                f'model: {model[0]}</p></div>',
+                unsafe_allow_html=True,
+            )
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Vs market average", f"{diff:+.1f}%")
+            m2.metric("Price per sq.ft", money(price / sqft))
+            m3.metric("House age", f"{REFERENCE_YEAR - year} yrs")
+            st.pyplot(fig_prediction_position(df, price))
+            if sqft > df.Square_Footage.max() or sqft < df.Square_Footage.min():
+                st.warning("The square footage is outside the range seen in the training "
+                           "data, so this estimate is less reliable.")
+
+    with tab_batch:
+        st.write("Upload a CSV containing these columns: "
+                 + ", ".join(f"`{c}`" for c in BASE_FEATURES))
+        template = pd.DataFrame([{
+            "Square_Footage": 2500, "Num_Bedrooms": 3, "Num_Bathrooms": 2,
+            "Year_Built": 2000, "Lot_Size": 2.5, "Garage_Size": 1, "Neighborhood_Quality": 6,
+        }])
+        st.download_button("⬇️ Download CSV template", template.to_csv(index=False),
+                           "batch_template.csv", "text/csv")
+        up = st.file_uploader("Upload houses to price", type="csv", key="batch_up")
+        if up is not None:
+            try:
+                out = predict_batch(model[1], pd.read_csv(up))
+                st.dataframe(out)
+                st.download_button("⬇️ Download predictions", out.to_csv(index=False),
+                                   "predictions.csv", "text/csv")
+            except Exception as exc:
+                st.error(f"Could not process file: {exc}")
+
+
+# -------------------------------------------------------------- page: about --
+def page_about():
+    hero("ℹ️ About", "Project information, features and limitations.")
+    st.markdown(
+        """
+        **Technology stack** - Python, pandas, NumPy, scikit-learn, Matplotlib,
+        Seaborn, Streamlit, joblib.
+
+        **Models compared** - Linear Regression, Ridge Regression, Random Forest,
+        Gradient Boosting (80/20 train-test split, 5-fold cross-validation).
+
+        **Engineered features** - `House_Age`, `Total_Rooms`, `Sqft_per_Bedroom`.
+
+        **Limitations**
+        - The dataset has only 1,000 records and no location data (city, ZIP code).
+        - Prices are treated as US dollars; the INR view is an approximate
+          conversion using the exchange rate you enter in the sidebar.
+        - Predictions are statistical estimates, not professional valuations.
+        """
+    )
+
+
+# ============================================================================
+# 6. APPLICATION ENTRY POINT
+# ============================================================================
+def main():
+    st.set_page_config(page_title=APP_TITLE, page_icon="🏠", layout="wide")
+    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+    # ------------------------------------------------------------ sidebar ----
+    st.sidebar.title("🏠 House Price AI")
+    page = st.sidebar.radio(
+        "Navigate",
+        ["Home", "Data Explorer", "Model Performance", "Predict Price", "About"],
+    )
+    st.sidebar.divider()
+    currency = st.sidebar.selectbox("Display currency", ["USD ($)", "INR (₹)"])
+    inr_rate = 85.0
+    if currency == "INR (₹)":
+        inr_rate = st.sidebar.number_input("USD → INR rate", 50.0, 150.0, 85.0, step=0.5,
+                                           help="Adjust to the current exchange rate.")
+    money = lambda v: format_money(v, currency, inr_rate)
+
+    st.sidebar.divider()
+    uploaded = st.sidebar.file_uploader("Use your own dataset (optional)", type="csv")
+
+    # --------------------------------------------------------- load + train --
+    try:
+        if uploaded is not None:
+            df = cached_load(uploaded.getvalue(), is_bytes=True)
+        else:
+            here = os.path.dirname(os.path.abspath(__file__))
+            path = os.path.join(here, DATA_FILE)
+            if not os.path.exists(path):
+                st.error(f"`{DATA_FILE}` was not found next to the app. Place it in the "
+                         "same folder, or upload a CSV from the sidebar.")
+                st.stop()
+            df = cached_load(path)
+    except ValueError as exc:
+        st.error(str(exc))
+        st.stop()
+
+    bundle = cached_train(df)
+    st.sidebar.caption(f"Active model: **{bundle['best_name']}**")
+
+    # ------------------------------------------------------------- routing ---
+    if page == "Home":
+        page_home(df, bundle, money)
+    elif page == "Data Explorer":
+        page_data(df, money)
+    elif page == "Model Performance":
+        page_model(bundle)
+    elif page == "Predict Price":
+        page_predict(df, bundle, money)
+    else:
+        page_about()
+
+
+if __name__ == "__main__":
+    main()
